@@ -466,3 +466,71 @@ def test_events_since_rpc_serves_a_turn_past_the_ring(tmp_path, monkeypatch):
     assert result["latest_seq"] == total
     assert result["count"] == total
     assert [frame["seq"] for frame in result["events"]] == list(range(1, total + 1))
+
+
+def test_mid_turn_hole_is_reported_as_truncated(tmp_path, monkeypatch):
+    """A frame missing in the middle of a turn is a hole, not a complete replay.
+
+    An oversized frame is never retained in the ring and never spooled, so the gap can sit
+    anywhere in the range. Checking only the seq at the cursor answered "complete" for it and the
+    client painted a reply with a missing block.
+    """
+    import os
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    sid = "mid-hole"
+    path = event_replay._spool_path(sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = event_replay._freeze_params({"type": "message.delta", "session_id": sid, "payload": {}})
+    with open(path, "wb") as handle:
+        for seq in range(1, 601):
+            if seq == 300:  # the frame that was never retained and never spooled
+                continue
+            handle.write(str(seq).encode("ascii") + b"\t" + payload + b"\n")
+
+    with event_replay._replay_lock:
+        event_replay._replay_next_seq[sid] = 600
+        event_replay._replay_evicted_through[sid] = 600
+
+    frames = events_since(sid, 0)
+    assert len(frames) == 599
+    assert event_replay.is_truncated(sid, 0) is True
+    # A cursor past the hole is servable again.
+    assert event_replay.is_truncated(sid, 300) is False
+
+
+def test_spool_stays_inside_both_bounds_and_stops_rewriting(tmp_path, monkeypatch):
+    """The 2 MiB cap and the 16,384-line window both hold, and crossing them does not thrash.
+
+    A trim that keeps a line count can leave the file over the byte cap, so the next append trips
+    the same trigger and rewrites the whole file again — on the thread that emits events, under a
+    lock every session shares.
+    """
+    import os
+    import time
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    sid = "cap"
+    payload_text = "x" * 3000
+    for seq in range(1, 1201):  # ~3.6 MiB of frames against a 2 MiB cap
+        event_replay._stamp_event({"method": "event", "params": {
+            "type": "tool.complete", "session_id": sid, "payload": {"text": payload_text}}})
+
+    path = event_replay._spool_path(sid)
+    size = os.path.getsize(path)
+    lines = sum(1 for _ in open(path, "rb"))
+    assert size <= event_replay._SPOOL_MAX_BYTES, size
+    assert lines <= event_replay._SPOOL_KEEP_LINES, lines
+
+    started = time.perf_counter()
+    for _ in range(200):
+        event_replay._stamp_event({"method": "event", "params": {
+            "type": "tool.complete", "session_id": sid, "payload": {"text": payload_text}}})
+    elapsed = time.perf_counter() - started
+
+    assert os.path.getsize(path) <= event_replay._SPOOL_MAX_BYTES
+    assert elapsed < 2.0, f"200 appends after the cap took {elapsed:.2f}s (trim thrash)"

@@ -63,7 +63,14 @@ _replay_forgotten: set[str] = set()
 _SPOOL_DIR_NAME = ("runtime", "event_spool")
 _SPOOL_MAX_BYTES = 2 * 1024 * 1024
 _SPOOL_KEEP_LINES = 16384
+# Trim to a target below the bound, not to the bound. Trimming to "just under" leaves no room for
+# the next frame, so a 3 KiB frame stream trips the trigger on nearly every append and rewrites
+# the whole file each time — 10 ms per event on the thread that emits it. A quarter of the bound
+# as headroom turns that into one trim per few hundred frames.
+_SPOOL_TRIM_TO_BYTES = (_SPOOL_MAX_BYTES * 3) // 4
+_SPOOL_TRIM_TO_LINES = (_SPOOL_KEEP_LINES * 3) // 4
 _spool_bytes: dict[str, int] = {}
+_spool_lines: dict[str, int] = {}
 _spool_lock = threading.Lock()
 
 
@@ -85,11 +92,19 @@ def _spool_append(sid: str, seq: int, payload: bytes) -> None:
     try:
         with _spool_lock:
             size = _spool_bytes.get(sid)
-            if size is None:
+            lines = _spool_lines.get(sid)
+            if size is None or lines is None:
                 try:
                     size = os.path.getsize(path)
                 except OSError:
                     size = 0
+                # The cache was cold (first frame after a restart): count what is on disk so the
+                # line bound is enforced from the first append, not after it overflows again.
+                try:
+                    with open(path, "rb") as existing:
+                        lines = sum(1 for _ in existing)
+                except OSError:
+                    lines = 0
             line = str(seq).encode("ascii") + b"\t" + payload + b"\n"
             try:
                 handle = open(path, "ab")
@@ -103,22 +118,38 @@ def _spool_append(sid: str, seq: int, payload: bytes) -> None:
                 handle.write(line)
                 size += len(line)
             _spool_bytes[sid] = size
-            if size > _SPOOL_MAX_BYTES:
+            _spool_lines[sid] = lines = lines + 1
+            if size > _SPOOL_MAX_BYTES or lines > _SPOOL_KEEP_LINES:
                 _spool_trim(sid, path)
     except OSError:
         return
 
 
 def _spool_trim(sid: str, path: str) -> None:
-    """Keep the newest _SPOOL_KEEP_LINES lines when a spool outgrows its cap (caller holds lock)."""
+    """Drop the oldest lines until the spool is under both bounds, with headroom (caller holds the lock).
+
+    Trimming to a line count alone leaves a file that is still over the byte cap, so the append
+    that follows trips the same condition and rewrites the whole file again — on the thread that
+    emits events, under a lock every session shares (measured: 0.8 s for 20k appends becomes
+    165 s). Dropping from the head until both bounds hold makes the trigger answer true once.
+    """
     try:
         with open(path, "rb") as handle:
-            lines = handle.readlines()[-_SPOOL_KEEP_LINES:]
-        with open(path, "wb") as handle:
-            handle.writelines(lines)
-        _spool_bytes[sid] = sum(len(line) for line in lines)
+            lines = handle.readlines()
+        total = sum(len(line) for line in lines)
+        start = 0
+        while start < len(lines) and (total > _SPOOL_TRIM_TO_BYTES or len(lines) - start > _SPOOL_TRIM_TO_LINES):
+            total -= len(lines[start])
+            start += 1
+        kept = lines[start:]
+        if start:
+            with open(path, "wb") as handle:
+                handle.writelines(kept)
+        _spool_bytes[sid] = total
+        _spool_lines[sid] = len(kept)
     except OSError:
         _spool_bytes.pop(sid, None)
+        _spool_lines.pop(sid, None)
 
 
 def _spool_read(sid: str, last_seen: int) -> list[tuple[int, bytes]]:
@@ -144,35 +175,6 @@ def _spool_read(sid: str, last_seen: int) -> list[tuple[int, bytes]]:
     return out
 
 
-def _spool_next_after(sid: str, last_seen: int) -> int | None:
-    """Smallest seq on disk greater than *last_seen*, or None.
-
-    Returned as a seq rather than a boolean because contiguity is the question: the spool can
-    hold a hole (an oversized frame is never written), and then the next seq is not last_seen+1.
-
-    The minimum, not the first match: ``_stamp_event`` appends after releasing the ring lock, so
-    two emitters of one session can land seq 6 before seq 5. Reading the file's first match would
-    then answer 6 for a complete turn and flag it truncated, which is the defect the spool exists
-    to remove.
-    """
-    if not sid:
-        return None
-    best: int | None = None
-    try:
-        with open(_spool_path(sid), "rb") as handle:
-            for line in handle:
-                head = line.partition(b"\t")[0]
-                try:
-                    seq = int(head)
-                except ValueError:
-                    continue
-                if seq > last_seen and (best is None or seq < best):
-                    best = seq
-    except OSError:
-        return None
-    return best
-
-
 def _spool_forget(sid: str) -> None:
     try:
         os.unlink(_spool_path(sid))
@@ -180,6 +182,7 @@ def _spool_forget(sid: str) -> None:
         pass
     with _spool_lock:
         _spool_bytes.pop(sid, None)
+        _spool_lines.pop(sid, None)
 
 
 def replay_epoch() -> str:
@@ -350,12 +353,15 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
     return [_thaw_params(payload, seq) for seq, payload in snapshots]
 
 
-def is_truncated(sid: str, last_seen: int) -> bool:
-    """True when a seq after *last_seen* is no longer servable, so the client must refetch.
+def is_truncated(sid: str, last_seen: int, *, served: int | None = None) -> bool:
+    """True when the reply would not carry every seq after *last_seen*, so the client must refetch.
 
     Ring eviction alone is not a gap any more: the durable spool still holds the turn. The
-    question is whether anything can serve the *contiguous* range from last_seen + 1, so
-    compare the oldest seq either source still has against that.
+    question is whether the union of the two sources covers the whole range last_seen+1..latest,
+    so count what can be served. A short count is a hole anywhere in the range, not only at its
+    head: an oversized frame is never retained and never spooled, and one in the middle of a turn
+    used to be reported as a complete replay. ``served`` lets the RPC pass the frames it already
+    built instead of decoding them twice.
     """
     sid = sid or ""
     with _replay_lock:
@@ -364,15 +370,9 @@ def is_truncated(sid: str, last_seen: int) -> bool:
         return False
     if sid in _replay_forgotten:
         return True
-    with _replay_lock:
-        buf = _replay_buffers.get(sid)
-        ring_next = next((seq for seq, _p, _s in buf if seq > last_seen), None) if buf else None
-    candidates = [seq for seq in (ring_next, _spool_next_after(sid, last_seen)) if seq is not None]
-    if not candidates:
-        return True
-    # Servable only if the very next seq is there; anything larger means a hole the client must
-    # close by refetching history.
-    return min(candidates) != last_seen + 1
+    if served is None:
+        served = len(events_since(sid, last_seen))
+    return served != latest - last_seen
 
 
 def latest_seq(sid: str) -> int:
@@ -390,6 +390,7 @@ def reset_replay_state() -> None:
             _spool_forget(sid)
         with _spool_lock:
             _spool_bytes.clear()
+            _spool_lines.clear()
         _replay_buffers.clear()
         _replay_buffer_bytes.clear()
         _replay_evicted_through.clear()
