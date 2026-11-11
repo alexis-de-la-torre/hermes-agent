@@ -46,6 +46,7 @@ try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import JSONResponse
+    from starlette.middleware.gzip import GZipMiddleware
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
     # running `hermes dashboard` needs fastapi+uvicorn; lazy install keeps
@@ -58,6 +59,7 @@ except ImportError:
         )
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import JSONResponse
+        from starlette.middleware.gzip import GZipMiddleware
     except Exception:
         raise SystemExit(
             "Web UI requires fastapi and uvicorn.\n"
@@ -560,6 +562,23 @@ async def _dashboard_health_middleware(request: Request, call_next):
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
     return response
+
+
+@app.middleware("http")
+async def _api_timing_middleware(request: Request, call_next):
+    """Log every /api/ read with its wall time: the only way to see the app's HTTP leg."""
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    started = time.perf_counter()
+    response = await call_next(request)
+    _log.info("api %s %s %s %.0fms", request.method, request.url.path.split("?")[0],
+              response.status_code, (time.perf_counter() - started) * 1000)
+    return response
+
+
+# Finite JSON/text reads only: Starlette's responder excludes ranges, downloads and
+# text/event-stream, and level 1 halves the CPU of level 5 for ~8% more bytes.
+app.add_middleware(GZipMiddleware, minimum_size=4096, compresslevel=1)
 
 
 def _is_trusted_local_origin(origin: str) -> bool:
