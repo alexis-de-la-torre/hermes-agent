@@ -376,9 +376,10 @@ def test_a_raising_teardown_still_releases_the_replay_ring(monkeypatch):
 def test_reconnect_that_outlasts_the_ring_is_served_from_the_spool(tmp_path, monkeypatch):
     """A client that was away for a whole turn must get the turn, not a refetch it cannot satisfy.
 
-    The ring is bounded (~20s of streaming at the 33ms delta coalesce) and the transcript only
-    reaches SQLite at turn end, so ring-only replay leaves a mid-turn reconnect with nothing to
-    show. The spool is the durable tail: same offsets, same frames, no protocol change.
+    The ring is bounded (~20s of streaming at the 33ms delta coalesce), and the transcript only
+    gains the assistant message at turn end (tool rows are flushed earlier), so ring-only replay
+    leaves a mid-turn reconnect with nothing to show for the streaming answer. The spool is the
+    durable tail: same offsets, same frames, no protocol change.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     reset_replay_state()
@@ -399,3 +400,69 @@ def test_reconnect_that_outlasts_the_ring_is_served_from_the_spool(tmp_path, mon
     tail = events_since("s1", total - 10)
     assert [frame["seq"] for frame in tail] == list(range(total - 9, total + 1))
     reset_replay_state()
+
+
+def test_truncation_flag_ignores_spool_line_order(tmp_path, monkeypatch):
+    """A complete replay is complete however the spool lines landed.
+
+    ``_stamp_event`` assigns the seq under the ring lock and appends to the spool after releasing
+    it, so two emitters of one session can write seq 6 before seq 5. The flag must answer "is any
+    seq after last_seen missing", not "is the first line I meet the next seq" — otherwise a
+    complete turn is refused as truncated and the client falls back to the transcript, which is
+    the defect the spool exists to remove.
+
+    Every frame is on disk here; only the order of the pair at the cursor is swapped.
+    """
+    import os
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    sid = "order-race"
+    path = event_replay._spool_path(sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = event_replay._freeze_params({"type": "message.delta", "session_id": sid, "payload": {}})
+    with open(path, "wb") as handle:
+        for seq in (1, 2, 3, 4, 6, 5):  # 6 landed before 5: the append-after-lock window
+            handle.write(str(seq).encode("ascii") + b"\t" + payload + b"\n")
+
+    with event_replay._replay_lock:
+        event_replay._replay_next_seq[sid] = 6
+        event_replay._replay_evicted_through[sid] = 6  # the ring has evicted its start
+
+    assert [frame["seq"] for frame in events_since(sid, 4)] == [5, 6]
+    assert event_replay.is_truncated(sid, 4) is False
+
+
+def test_events_since_rpc_serves_a_turn_past_the_ring(tmp_path, monkeypatch):
+    """Through the method the client calls, with the field the client actually sends.
+
+    ``last_seen`` is the wire field (``seq`` is only the log label in ``ws.py``); the params model
+    forbids extras, so a caller written as ``since(seq=0)`` is refused before dispatch. Seeded past
+    the ring, the reply must carry every frame and no truncation flag — on a tree without the
+    spool this same call answers ``truncated=True`` with 512 frames.
+    """
+    from pydantic import ValidationError
+
+    from tui_gateway import server
+    from tui_gateway.contracts.sessions import SessionEventsSinceParams
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    SessionEventsSinceParams.model_validate({"session_id": "s1", "last_seen": 0})
+    with pytest.raises(ValidationError):
+        SessionEventsSinceParams.model_validate({"session_id": "s1", "seq": 0})
+
+    total = 1600
+    for _ in range(total):
+        event_replay._stamp_event(_frame("s1"))
+
+    handler = server._methods["session.events.since"]
+    reply = handler("r1", {"session_id": "s1", "last_seen": 0})
+    result = reply["result"]
+
+    assert result["truncated"] is False
+    assert result["latest_seq"] == total
+    assert result["count"] == total
+    assert [frame["seq"] for frame in result["events"]] == list(range(1, total + 1))

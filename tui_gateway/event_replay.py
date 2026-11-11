@@ -149,9 +149,15 @@ def _spool_next_after(sid: str, last_seen: int) -> int | None:
 
     Returned as a seq rather than a boolean because contiguity is the question: the spool can
     hold a hole (an oversized frame is never written), and then the next seq is not last_seen+1.
+
+    The minimum, not the first match: ``_stamp_event`` appends after releasing the ring lock, so
+    two emitters of one session can land seq 6 before seq 5. Reading the file's first match would
+    then answer 6 for a complete turn and flag it truncated, which is the defect the spool exists
+    to remove.
     """
     if not sid:
         return None
+    best: int | None = None
     try:
         with open(_spool_path(sid), "rb") as handle:
             for line in handle:
@@ -160,11 +166,11 @@ def _spool_next_after(sid: str, last_seen: int) -> int | None:
                     seq = int(head)
                 except ValueError:
                     continue
-                if seq > last_seen:
-                    return seq
+                if seq > last_seen and (best is None or seq < best):
+                    best = seq
     except OSError:
         return None
-    return None
+    return best
 
 
 def _spool_forget(sid: str) -> None:
