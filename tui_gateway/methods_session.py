@@ -973,7 +973,9 @@ def _resume_cold(ctx: _Resume) -> dict:
                         todo_state=_todo_state_from_history(history))
     if (reused := ctx.claim(sid, record)) is not None:
         return reused
-    _schedule_agent_build(sid)
+    # Let the transcript reach the client and paint before the build's imports + MCP
+    # handshakes starve the event loop (observed ~9 s per open with the 0.05 s default).
+    _schedule_agent_build(sid, delay=5.0)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
     return _resume_response(ctx, sid, record, info=ctx.info(cwd, overrides), display=display_history,
                             count_source=raw_history,
