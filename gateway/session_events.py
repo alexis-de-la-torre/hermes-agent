@@ -128,7 +128,7 @@ class SessionEvents:
             current_epoch, latest = self.watermark()
             frames = event_replay.events_since(self._key, sequence)
             missing = (epoch != current_epoch or sequence > latest
-                       or event_replay.is_truncated(self._key, sequence)
+                       or event_replay.is_truncated(self._key, sequence, served=len(frames))
                        or event_replay.latest_seq(self._key) != latest)
             events = [] if missing else [
                 {**frame, 'session_id': self._public_id} if frame.get('session_id') == self._key else frame

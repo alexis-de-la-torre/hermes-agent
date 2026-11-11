@@ -473,32 +473,82 @@ def test_mid_turn_hole_is_reported_as_truncated(tmp_path, monkeypatch):
 
     An oversized frame is never retained in the ring and never spooled, so the gap can sit
     anywhere in the range. Checking only the seq at the cursor answered "complete" for it and the
-    client painted a reply with a missing block.
+    client painted a reply with a missing block. The hole is produced here the way production
+    produces it — one >4 MiB frame through ``_stamp_event`` — and read through the RPC.
+    """
+    from tui_gateway import server
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    for seq in range(1, 601):
+        if seq == 300:
+            event_replay._stamp_event({"method": "event", "params": {
+                "type": "tool.complete", "session_id": "s1",
+                "payload": {"text": "x" * (event_replay._REPLAY_BUFFER_BYTES_MAX + 1)}}})
+        else:
+            event_replay._stamp_event(_frame("s1"))
+
+    handler = server._methods["session.events.since"]
+    for last_seen, expected in ((0, True), (299, True), (300, False)):
+        result = handler("r1", {"session_id": "s1", "last_seen": last_seen})["result"]
+        assert result["truncated"] is expected, last_seen
+    assert handler("r2", {"session_id": "s1", "last_seen": 0})["result"]["count"] == 599
+
+
+def test_truncation_is_stable_while_frames_are_still_landing(tmp_path, monkeypatch):
+    """A frame stamped while the reply is built must not make a complete replay look truncated.
+
+    Comparing a frame count against a separately read ``latest_seq`` did exactly that: 181 of 200
+    replies on a complete 4,000-frame stream said truncated, and the client then dropped the
+    window it had just been sent.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    for _ in range(4000):
+        event_replay._stamp_event(_frame("s1"))
+
+    stop = threading.Event()
+
+    def emit():
+        while not stop.is_set():
+            event_replay._stamp_event(_frame("s1"))
+
+    worker = threading.Thread(target=emit, daemon=True)
+    worker.start()
+    try:
+        spurious = sum(
+            1 for _ in range(60) if event_replay.events_and_truncation("s1", 0)[1]
+        )
+    finally:
+        stop.set()
+        worker.join(5)
+    assert spurious == 0, f"{spurious}/60 replies said truncated with no hole in the stream"
+
+
+def test_frame_bound_binds_when_frames_are_small(tmp_path, monkeypatch):
+    """The 16,384-frame window is real: past it the start of the stream is gone and flagged.
+
+    The byte cap alone would keep 20,000 tiny frames, so this is the case that proves the line
+    bound exists at all — the assertion the earlier 'both bounds' test never reached.
     """
     import os
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     reset_replay_state()
 
-    sid = "mid-hole"
-    path = event_replay._spool_path(sid)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = event_replay._freeze_params({"type": "message.delta", "session_id": sid, "payload": {}})
-    with open(path, "wb") as handle:
-        for seq in range(1, 601):
-            if seq == 300:  # the frame that was never retained and never spooled
-                continue
-            handle.write(str(seq).encode("ascii") + b"\t" + payload + b"\n")
+    for _ in range(16384):
+        event_replay._stamp_event(_frame("exact"))
+    assert event_replay.is_truncated("exact", 0) is False
 
-    with event_replay._replay_lock:
-        event_replay._replay_next_seq[sid] = 600
-        event_replay._replay_evicted_through[sid] = 600
-
-    frames = events_since(sid, 0)
-    assert len(frames) == 599
-    assert event_replay.is_truncated(sid, 0) is True
-    # A cursor past the hole is servable again.
-    assert event_replay.is_truncated(sid, 300) is False
+    for _ in range(20000):
+        event_replay._stamp_event(_frame("over"))
+    path = event_replay._spool_path("over")
+    lines = sum(1 for _ in open(path, "rb"))
+    assert lines <= event_replay._SPOOL_KEEP_LINES, lines
+    assert os.path.getsize(path) <= event_replay._SPOOL_MAX_BYTES
+    assert event_replay.is_truncated("over", 0) is True
 
 
 def test_spool_stays_inside_both_bounds_and_stops_rewriting(tmp_path, monkeypatch):

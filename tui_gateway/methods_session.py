@@ -2315,11 +2315,11 @@ def _(rid, params: dict) -> dict:
     except (TypeError, ValueError):
         return _err(rid, -32602, "invalid params: last_seen must be an integer")
     from tui_gateway import event_replay as er
-    frames = er.events_since(sid, last_seen)
+    frames, truncated = er.events_and_truncation(sid, last_seen)
     # ``epoch``: in-process seq — clients reset watermarks when this differs from gateway.ready's.
     # ``open_requests``: server→client requests still unanswered — the ring cannot carry "a question still
     # waiting", so the reconnecting client re-delivers these to its request handlers.
-    return _ok(rid, {"events": frames, "latest_seq": er.latest_seq(sid), "truncated": er.is_truncated(sid, last_seen, served=len(frames)),
+    return _ok(rid, {"events": frames, "latest_seq": er.latest_seq(sid), "truncated": truncated,
                      "count": len(frames), "epoch": er.replay_epoch(), "open_requests": _open_requests(sid)})
 
 

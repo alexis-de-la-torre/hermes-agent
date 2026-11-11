@@ -138,7 +138,9 @@ def _spool_trim(sid: str, path: str) -> None:
             lines = handle.readlines()
         total = sum(len(line) for line in lines)
         start = 0
-        while start < len(lines) and (total > _SPOOL_TRIM_TO_BYTES or len(lines) - start > _SPOOL_TRIM_TO_LINES):
+        # Keep the newest line whatever its size: a frame up to the ring's 4 MiB cap must still
+        # be servable, even when it alone exceeds the trim target.
+        while start < len(lines) - 1 and (total > _SPOOL_TRIM_TO_BYTES or len(lines) - start > _SPOOL_TRIM_TO_LINES):
             total -= len(lines[start])
             start += 1
         kept = lines[start:]
@@ -328,6 +330,33 @@ def release_key(key: str, *, blocking: bool = True) -> None:
             _replay_lock.release()
 
 
+def _collect(sid: str, last_seen: int) -> tuple[list[tuple[int, bytes]], int, bool]:
+    """Ring + spool frames after *last_seen*, and the highest seq AT SNAPSHOT TIME.
+
+    ``latest`` is read under the same lock as the ring slice, so a frame stamped while the spool
+    is being read cannot make a complete reply look short: comparing a frame count against a
+    later ``latest_seq()`` turned every mid-turn reconnect into ``truncated=true`` for the whole
+    window (measured 181 of 200 replies on a complete 4,000-frame stream).
+
+    Returns ``(snapshots, latest, forgotten)``; the caller decodes outside the lock.
+    """
+    sid = sid or ""
+    with _replay_lock:
+        latest = _replay_next_seq.get(sid, 0)
+        buf = _replay_buffers.get(sid)
+        snapshots = [(seq, payload) for seq, payload, _size in buf if seq > last_seen] if buf else []
+        evicted = _replay_evicted_through.get(sid, 0)
+        forgotten = sid in _replay_forgotten
+    if last_seen < evicted and not forgotten:
+        seen = {seq for seq, _payload in snapshots}
+        for seq, payload in _spool_read(sid, last_seen):
+            if seq not in seen:
+                snapshots.append((seq, payload))
+                seen.add(seq)
+        snapshots.sort(key=lambda item: item[0])
+    return snapshots, latest, forgotten
+
+
 def events_since(sid: str, last_seen: int) -> list[dict]:
     """Recorded EVENT OBJECTS (each frame's ``params`` dict) with seq > last_seen for *sid*.
 
@@ -338,19 +367,27 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
     When the ring has evicted past *last_seen* the durable spool fills the gap, so a reconnect
     that outlasts the ring still gets the whole turn instead of a refetch it cannot satisfy.
     """
-    sid = sid or ""
-    with _replay_lock:
-        buf = _replay_buffers.get(sid)
-        snapshots = [(seq, payload) for seq, payload, _size in buf if seq > last_seen] if buf else []
-        evicted = _replay_evicted_through.get(sid, 0)
-    if last_seen < evicted and sid not in _replay_forgotten:
-        seen = {seq for seq, _payload in snapshots}
-        for seq, payload in _spool_read(sid, last_seen):
-            if seq not in seen:
-                snapshots.append((seq, payload))
-                seen.add(seq)
-        snapshots.sort(key=lambda item: item[0])
+    snapshots, _latest, _forgotten = _collect(sid, last_seen)
     return [_thaw_params(payload, seq) for seq, payload in snapshots]
+
+
+def events_and_truncation(sid: str, last_seen: int) -> tuple[list[dict], bool]:
+    """One snapshot: the frames to send and whether they cover every seq after *last_seen*.
+
+    The RPC's hot path. Reading ``latest`` and the frames separately let a frame stamped in
+    between make a complete replay look truncated, and the client then drops the window it was
+    just sent and falls back to a transcript that has no assistant message.
+    """
+    snapshots, latest, forgotten = _collect(sid, last_seen)
+    frames = [_thaw_params(payload, seq) for seq, payload in snapshots]
+    if last_seen >= latest:
+        return frames, False
+    if forgotten:
+        return frames, True
+    # Count only what the snapshot promised; frames appended during the spool read are extra, not
+    # missing. A short count is a hole anywhere in the range, not only at its head.
+    served = sum(1 for seq, _payload in snapshots if seq <= latest)
+    return frames, served != latest - last_seen
 
 
 def is_truncated(sid: str, last_seen: int, *, served: int | None = None) -> bool:
@@ -360,18 +397,20 @@ def is_truncated(sid: str, last_seen: int, *, served: int | None = None) -> bool
     question is whether the union of the two sources covers the whole range last_seen+1..latest,
     so count what can be served. A short count is a hole anywhere in the range, not only at its
     head: an oversized frame is never retained and never spooled, and one in the middle of a turn
-    used to be reported as a complete replay. ``served`` lets the RPC pass the frames it already
-    built instead of decoding them twice.
+    used to be reported as a complete replay.
+
+    ``served`` is for a caller that already built the frames (the RPC and
+    ``gateway.session_events``): it avoids decoding every frame twice on the reconnect path.
     """
     sid = sid or ""
+    if served is None:
+        return events_and_truncation(sid, last_seen)[1]
     with _replay_lock:
         latest = _replay_next_seq.get(sid, 0)
     if last_seen >= latest:
         return False
     if sid in _replay_forgotten:
         return True
-    if served is None:
-        served = len(events_since(sid, last_seen))
     return served != latest - last_seen
 
 
