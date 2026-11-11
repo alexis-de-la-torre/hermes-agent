@@ -485,6 +485,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         nonlocal dispatch_crashes
         req_id = req.get("id") if isinstance(req, dict) else None
         req_method = req.get("method") if isinstance(req, dict) else None
+        _rpc_started = time.perf_counter()
         # dispatch() may schedule long handlers on the pool; it returns None then and the worker
         # writes the response itself via transport.write (a separate thread, so that is the safe
         # path). Inline handlers return the response dict, written here from the loop.
@@ -498,6 +499,20 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                          "ws dispatch-crash reply send failed peer=%s id=%s method=%s", peer, req_id, req_method)
             return
         if resp is not None:
+            _log.info("ws rpc peer=%s id=%s method=%s ms=%.0f error=%s", peer, req_id, req_method,
+                      (time.perf_counter() - _rpc_started) * 1000,
+                      (resp.get("error") or {}).get("code") if isinstance(resp, dict) else None)
+            if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                _r = resp["result"]
+                if req_method == "session.events.since":
+                    _log.info("events.since seq=%s latest=%s epoch=%s truncated=%s events=%s",
+                              (req or {}).get("params", {}).get("last_seen"),
+                              _r.get("latest_seq"), _r.get("epoch"), _r.get("truncated"),
+                              len(_r.get("events") or []))
+                elif req_method == "session.resume":
+                    _log.info("resume running=%s status=%s msgs=%s omitted=%s hydrating=%s",
+                              _r.get("running"), _r.get("status"), _r.get("message_count"),
+                              _r.get("messages_omitted"), _r.get("hydrating"))
             await _reply(resp, "send_failed_after_response",
                          "ws response send failed peer=%s id=%s method=%s", peer, req_id, req_method)
 
