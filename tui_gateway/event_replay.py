@@ -59,7 +59,10 @@ _replay_forgotten: set[str] = set()
 # uses (record every chunk in a log, resume by offset), with a file as the log.
 #
 # Nothing here is a source of truth: the spool is a replay tail, bounded per session and
-# deleted at teardown. A missing or unreadable spool degrades to today's behaviour.
+# deleted at teardown. A missing or unreadable spool degrades to today's behaviour. The bounds are
+# bytes and lines; the newest line is always kept, so a single frame larger than the trim target
+# leaves the file up to one frame over the byte bound rather than dropping the only frame a
+# reattach could use.
 _SPOOL_DIR_NAME = ("runtime", "event_spool")
 _SPOOL_MAX_BYTES = 2 * 1024 * 1024
 _SPOOL_KEEP_LINES = 16384
@@ -145,8 +148,13 @@ def _spool_trim(sid: str, path: str) -> None:
             start += 1
         kept = lines[start:]
         if start:
-            with open(path, "wb") as handle:
+            # Write beside the file and rename: an in-flight _spool_read keeps the old inode and
+            # never sees a half-written line (measured: 27 of 40 interleaved trims produced an
+            # unparseable line, which surfaced as JSONDecodeError out of session.events.since).
+            staging = path + ".trim"
+            with open(staging, "wb") as handle:
                 handle.writelines(kept)
+            os.replace(staging, path)
         _spool_bytes[sid] = total
         _spool_lines[sid] = len(kept)
     except OSError:
@@ -163,6 +171,11 @@ def _spool_read(sid: str, last_seen: int) -> list[tuple[int, bytes]]:
     try:
         with open(path, "rb") as handle:
             for line in handle:
+                if not line.endswith(b"\n"):
+                    # The writer is mid-append on this line. A tail follower only trusts complete
+                    # lines; counting half of one made a reconnect during an append report
+                    # truncated for a stream with no hole.
+                    continue
                 head, sep, payload = line.partition(b"\t")
                 if not sep:
                     continue
@@ -197,6 +210,14 @@ def _freeze_params(params: dict) -> bytes:
     return json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8", errors="surrogatepass"
     )
+
+
+def _thaw_params_or_none(payload: bytes, seq: int) -> dict | None:
+    """_thaw_params, but a torn or unparseable line is skipped instead of failing the reply."""
+    try:
+        return _thaw_params(payload, seq)
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def _thaw_params(payload: bytes, seq: int) -> dict:
@@ -368,7 +389,8 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
     that outlasts the ring still gets the whole turn instead of a refetch it cannot satisfy.
     """
     snapshots, _latest, _forgotten = _collect(sid, last_seen)
-    return [_thaw_params(payload, seq) for seq, payload in snapshots]
+    frames = (_thaw_params_or_none(payload, seq) for seq, payload in snapshots)
+    return [frame for frame in frames if frame is not None]
 
 
 def events_and_truncation(sid: str, last_seen: int) -> tuple[list[dict], bool]:
@@ -379,14 +401,16 @@ def events_and_truncation(sid: str, last_seen: int) -> tuple[list[dict], bool]:
     just sent and falls back to a transcript that has no assistant message.
     """
     snapshots, latest, forgotten = _collect(sid, last_seen)
-    frames = [_thaw_params(payload, seq) for seq, payload in snapshots]
+    frames = [frame for frame in (_thaw_params_or_none(payload, seq) for seq, payload in snapshots)
+              if frame is not None]
     if last_seen >= latest:
         return frames, False
     if forgotten:
         return frames, True
-    # Count only what the snapshot promised; frames appended during the spool read are extra, not
-    # missing. A short count is a hole anywhere in the range, not only at its head.
-    served = sum(1 for seq, _payload in snapshots if seq <= latest)
+    # Count only frames that decoded AND were promised by the snapshot: frames appended during
+    # the spool read are extra, not missing, and a torn line the reader could not decode is a
+    # hole. A short count is a gap anywhere in the range, not only at its head.
+    served = sum(1 for frame in frames if frame.get("seq", 0) <= latest)
     return frames, served != latest - last_seen
 
 

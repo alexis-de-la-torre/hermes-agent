@@ -499,10 +499,11 @@ def test_mid_turn_hole_is_reported_as_truncated(tmp_path, monkeypatch):
 def test_truncation_is_stable_while_frames_are_still_landing(tmp_path, monkeypatch):
     """A frame stamped while the reply is built must not make a complete replay look truncated.
 
-    Comparing a frame count against a separately read ``latest_seq`` did exactly that: 181 of 200
-    replies on a complete 4,000-frame stream said truncated, and the client then dropped the
-    window it had just been sent.
+    Drives the RPC handler, which exists at every commit, so this fails on the regressed code
+    (185 of 200 replies said truncated there) instead of dying on a missing helper.
     """
+    from tui_gateway import server
+
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     reset_replay_state()
 
@@ -517,14 +518,42 @@ def test_truncation_is_stable_while_frames_are_still_landing(tmp_path, monkeypat
 
     worker = threading.Thread(target=emit, daemon=True)
     worker.start()
+    handler = server._methods["session.events.since"]
     try:
         spurious = sum(
-            1 for _ in range(60) if event_replay.events_and_truncation("s1", 0)[1]
+            1 for _ in range(60)
+            if handler("r", {"session_id": "s1", "last_seen": 0})["result"]["truncated"]
         )
     finally:
         stop.set()
         worker.join(5)
     assert spurious == 0, f"{spurious}/60 replies said truncated with no hole in the stream"
+
+
+def test_a_torn_spool_line_is_skipped_not_fatal(tmp_path, monkeypatch):
+    """A half-written line must not raise out of the replay or hide the frames around it."""
+    import os
+
+    from tui_gateway import server
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    reset_replay_state()
+
+    sid = "torn"
+    path = event_replay._spool_path(sid)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = event_replay._freeze_params({"type": "message.delta", "session_id": sid, "payload": {}})
+    with open(path, "wb") as handle:
+        for seq in (1, 2):
+            handle.write(str(seq).encode("ascii") + b"\t" + payload + b"\n")
+        handle.write(b'3\t{"type": "message.delta", "sess')  # torn mid-write, no newline
+    with event_replay._replay_lock:
+        event_replay._replay_next_seq[sid] = 3
+        event_replay._replay_evicted_through[sid] = 3
+
+    result = server._methods["session.events.since"]("r", {"session_id": sid, "last_seen": 0})["result"]
+    assert [frame["seq"] for frame in result["events"]] == [1, 2]
+    assert result["truncated"] is True  # seq 3 is not servable, and that is the honest answer
 
 
 def test_frame_bound_binds_when_frames_are_small(tmp_path, monkeypatch):
